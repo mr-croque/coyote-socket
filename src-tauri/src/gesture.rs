@@ -85,6 +85,14 @@ pub struct GestureSession {
     /// Baseline at the moment `pending` was set, per side. Finish adopts the
     /// written knob only when nothing has moved this side since then.
     baseline_at_write: [Option<u8>; 2],
+    /// Level before the oldest absolute write that has not been echoed yet.
+    /// A late serial-0 report is measured against this as well as the baseline.
+    anchor: [Option<u8>; 2],
+    /// Value of the latest absolute write on this side. A serial-1 echo applies
+    /// only when it matches.
+    latest_write: [Option<u8>; 2],
+    /// A serial-0 report already moved this side's baseline since the latest write.
+    serial0_moved: [bool; 2],
 }
 
 impl GestureSession {
@@ -106,6 +114,9 @@ impl GestureSession {
             commanded: [None, None],
             pending: [None, None],
             baseline_at_write: [None, None],
+            anchor: [None, None],
+            latest_write: [None, None],
+            serial0_moved: [false, false],
         }
     }
 
@@ -133,6 +144,13 @@ impl GestureSession {
         }
         self.pending = [None, None];
         let commanded = [Some(channel_a.min(200)), Some(channel_b.min(200))];
+        for index in 0..2 {
+            if self.anchor[index].is_none() {
+                self.anchor[index] = self.baseline[index];
+            }
+            self.latest_write[index] = commanded[index];
+            self.serial0_moved[index] = false;
+        }
         self.commanded = commanded;
         self.baseline = commanded;
         self.output_ok = true;
@@ -147,8 +165,14 @@ impl GestureSession {
         }
         for index in 0..2 {
             if let Some(level) = levels[index] {
+                let level = level.min(200);
+                if self.anchor[index].is_none() {
+                    self.anchor[index] = self.baseline[index];
+                }
+                self.latest_write[index] = Some(level);
+                self.serial0_moved[index] = false;
                 self.baseline_at_write[index] = self.baseline[index];
-                self.pending[index] = Some(level.min(200));
+                self.pending[index] = Some(level);
             }
         }
     }
@@ -188,12 +212,7 @@ impl GestureSession {
         };
 
         if parsed.echo {
-            for (index, reported) in parsed.sides.into_iter().enumerate() {
-                if let Some(reported) = reported {
-                    self.baseline[index] = Some(reported);
-                    self.commanded[index] = Some(reported);
-                }
-            }
+            self.apply_echo(parsed.sides);
             return Vec::new();
         }
 
@@ -211,20 +230,60 @@ impl GestureSession {
             let side = if index == 0 { Side::A } else { Side::B };
             // A drop to 0 is a press from the last confirmed level, including
             // while a different knob write is in flight.
-            let gesture = if reported == 0 && baseline >= 2 {
-                Gesture::Press { side }
-            } else {
-                let reference = closer_level(reported, baseline, self.pending[index]);
-                Gesture::Flick {
-                    side,
-                    steps: reported as i16 - reference as i16,
-                }
-            };
-            self.baseline[index] = Some(reported);
-            self.commanded[index] = Some(reported);
-            gestures.push(gesture);
+            if reported == 0 && baseline >= 2 {
+                self.adopt_serial0(index, 0);
+                gestures.push(Gesture::Press { side });
+                continue;
+            }
+            let in_flight = self.pending[index].is_some();
+            let reference = closer_level(
+                reported,
+                baseline,
+                if in_flight {
+                    self.pending[index]
+                } else {
+                    self.anchor[index]
+                },
+            );
+            let steps = reported as i16 - reference as i16;
+            if steps == 0 {
+                continue;
+            }
+            // After the write has returned, a report nearer the pre-write level
+            // is one step from that level. Do not store that byte: pause must
+            // keep measuring later flicks from the zero the box is holding.
+            let from_old_level = !in_flight
+                && self.anchor[index] == Some(reference)
+                && self.anchor[index] != Some(baseline);
+            gestures.push(Gesture::Flick { side, steps });
+            if !from_old_level {
+                self.adopt_serial0(index, reported);
+            }
         }
         gestures
+    }
+
+    fn adopt_serial0(&mut self, index: usize, reported: u8) {
+        self.baseline[index] = Some(reported);
+        self.commanded[index] = Some(reported);
+        self.serial0_moved[index] = true;
+    }
+
+    fn apply_echo(&mut self, sides: [Option<u8>; 2]) {
+        for (index, reported) in sides.into_iter().enumerate() {
+            let Some(reported) = reported else {
+                continue;
+            };
+            if self.latest_write[index] != Some(reported) {
+                continue;
+            }
+            self.anchor[index] = None;
+            if !self.serial0_moved[index] {
+                self.baseline[index] = Some(reported);
+                self.commanded[index] = Some(reported);
+            }
+            self.serial0_moved[index] = false;
+        }
     }
 }
 
@@ -506,75 +565,67 @@ pub async fn finish_level_write(ok: bool) {
     session_slot().lock().await.finish_level_write(ok);
 }
 
-pub async fn push_notify(bytes: &[u8]) -> Vec<Gesture> {
-    let (gestures, message) = {
+/// Classify a notify and store any intensity change before releasing the session.
+///
+/// The output tick samples the baseline and the ceiling while holding this same
+/// session lock, so both values are visible together. Log lines are written
+/// after the locks are released.
+pub async fn ingest_notify(bytes: &[u8]) {
+    let settings = crate::settings::get_settings().await;
+    let caps = [
+        settings.general.channel_a_max_intensity.min(200),
+        settings.general.channel_b_max_intensity.min(200),
+    ];
+
+    let (notify_line, commit_lines, patches) = {
         let mut session = session_slot().lock().await;
         let armed = session.is_armed();
         let before = session.baseline();
         let gestures = session.notify(bytes);
         let after = session.baseline();
-        let message = format!(
+        let notify_line = format!(
             "notify hex={} armed={armed} before={} after={} gestures={}",
             hex_bytes(bytes),
             fmt_baseline(before),
             fmt_baseline(after),
             fmt_gestures(&gestures),
         );
-        (gestures, message)
+
+        let mut commit_lines = Vec::new();
+        let mut patches = Vec::new();
+        if !gestures.is_empty() {
+            let state = crate::processing::get_processing_state().await;
+            let mut guard = state.write().await;
+            for gesture in gestures {
+                let (channel_id, cap_index) = match gesture.side() {
+                    Side::A => (crate::processing::ChannelId::A, 0),
+                    Side::B => (crate::processing::ChannelId::B, 1),
+                };
+                let intensity = &mut guard.channel_mut(channel_id).config.intensity;
+                let before_source = intensity.clone();
+                let after_source =
+                    apply_intensity_gesture(&before_source, gesture, caps[cap_index]);
+                commit_lines.push(format!(
+                    "commit {} {gesture:?} ceiling {:.0}->{:.0} static {:?}->{:?} cap={}",
+                    channel_id_label(channel_id),
+                    before_source.range_max,
+                    after_source.range_max,
+                    before_source.static_value,
+                    after_source.static_value,
+                    caps[cap_index],
+                ));
+                let patch = intensity_patch(&before_source, &after_source);
+                *intensity = after_source;
+                patches.push((channel_id, patch));
+            }
+        }
+        (notify_line, commit_lines, patches)
     };
-    trace_line(&message);
-    gestures
-}
 
-/// Write each gesture onto the live channel config, then tell the window the new fields.
-///
-/// Output pause does not pass through here: the device loop already skips sends while
-/// paused, and this only stores the new ceiling or fixed intensity.
-pub async fn commit_gestures(gestures: Vec<Gesture>) {
-    if gestures.is_empty() {
-        return;
-    }
-
-    let settings = crate::settings::get_settings().await;
-    let cap_a = settings.general.channel_a_max_intensity.min(200);
-    let cap_b = settings.general.channel_b_max_intensity.min(200);
-
-    let state = crate::processing::get_processing_state().await;
-    let guard = state.read().await;
-    let mut pending = Vec::with_capacity(gestures.len());
-
-    let mut commit_lines = Vec::with_capacity(gestures.len());
-    for gesture in gestures {
-        let (channel_id, cap) = match gesture.side() {
-            Side::A => (crate::processing::ChannelId::A, cap_a),
-            Side::B => (crate::processing::ChannelId::B, cap_b),
-        };
-        let mut config = guard.channel(channel_id).config.clone();
-        let before = config.intensity.clone();
-        let after = apply_intensity_gesture(&before, gesture, cap);
-        commit_lines.push(format!(
-            "commit {} {gesture:?} ceiling {:.0}->{:.0} static {:?}->{:?} cap={cap}",
-            channel_id_label(channel_id),
-            before.range_max,
-            after.range_max,
-            before.static_value,
-            after.static_value,
-        ));
-        let patch = intensity_patch(&before, &after);
-        config.intensity = after;
-        pending.push((channel_id, config, patch));
-    }
-    drop(guard);
+    trace_line(&notify_line);
     for line in commit_lines {
         trace_line(&line);
     }
-
-    let mut patches = Vec::with_capacity(pending.len());
-    for (channel_id, config, patch) in pending {
-        crate::install_channel_config(channel_id, config, None).await;
-        patches.push((channel_id, patch));
-    }
-
     for (channel_id, patch) in patches {
         if patch.ceiling.is_none() && patch.static_value.is_none() {
             continue;
@@ -652,14 +703,15 @@ mod tests {
         assert!(session.notify(&[0xB1, 0, 12]).is_empty());
         assert_eq!(session.baseline()[0], Some(11));
 
+        // 40 is not the latest write (10), so this echo does not move the baseline.
         assert!(session.notify(&b1(1, 40, 40)).is_empty());
-        assert_eq!(session.baseline(), [Some(40), Some(40)]);
+        assert_eq!(session.baseline(), [Some(11), Some(10)]);
 
         assert!(session.notify(&b1(2, 12, 10)).is_empty());
-        assert_eq!(session.baseline(), [Some(40), Some(40)]);
+        assert_eq!(session.baseline(), [Some(11), Some(10)]);
 
         assert!(session.notify(&[0xB0, 0, 12, 10]).is_empty());
-        assert_eq!(session.baseline(), [Some(40), Some(40)]);
+        assert_eq!(session.baseline(), [Some(11), Some(10)]);
     }
 
     #[test]
@@ -707,15 +759,78 @@ mod tests {
         session.finish_level_write(true);
         assert_eq!(session.baseline(), [Some(80), Some(10)]);
 
+        // 50 is not the knob we wrote.
         assert!(session.notify(&b1(1, 50, 10)).is_empty());
-        assert_eq!(session.baseline(), [Some(50), Some(10)]);
+        assert_eq!(session.baseline(), [Some(80), Some(10)]);
+
+        assert!(session.notify(&b1(1, 80, 10)).is_empty());
+        assert_eq!(session.baseline(), [Some(80), Some(10)]);
         assert_eq!(
-            session.notify(&b1(0, 51, 10)),
+            session.notify(&b1(0, 81, 10)),
             vec![Gesture::Flick {
                 side: Side::A,
                 steps: 1
             }]
         );
+        assert_eq!(session.baseline(), [Some(81), Some(10)]);
+
+        // The echo of the write we already passed must not undo the flick.
+        assert!(session.notify(&b1(1, 80, 10)).is_empty());
+        assert_eq!(session.baseline(), [Some(81), Some(10)]);
+    }
+
+    #[test]
+    fn late_serial0_after_pause_is_one_step_and_baseline_stays_zero() {
+        let mut session = GestureSession::coyote3();
+        arm(&mut session, 40, 30);
+        session.output_written(0, 0);
+        assert_eq!(session.baseline(), [Some(0), Some(0)]);
+
+        assert_eq!(
+            session.notify(&b1(0, 41, 30)),
+            vec![Gesture::Flick {
+                side: Side::A,
+                steps: 1
+            }]
+        );
+        assert_eq!(session.baseline(), [Some(0), Some(0)]);
+
+        assert!(session.notify(&b1(1, 0, 0)).is_empty());
+        assert_eq!(session.baseline(), [Some(0), Some(0)]);
+        assert_eq!(
+            session.notify(&b1(0, 1, 0)),
+            vec![Gesture::Flick {
+                side: Side::A,
+                steps: 1
+            }]
+        );
+        assert_eq!(session.baseline(), [Some(1), Some(0)]);
+    }
+
+    #[test]
+    fn late_serial0_after_a_large_write_is_one_step_from_the_old_level() {
+        let mut session = GestureSession::coyote3();
+        arm(&mut session, 40, 10);
+        session.begin_level_write([Some(90), None]);
+        session.finish_level_write(true);
+        assert_eq!(session.baseline(), [Some(90), Some(10)]);
+
+        assert_eq!(
+            session.notify(&b1(0, 41, 10)),
+            vec![Gesture::Flick {
+                side: Side::A,
+                steps: 1
+            }]
+        );
+        assert_eq!(session.baseline(), [Some(90), Some(10)]);
+
+        // An older echo must not pull the baseline back.
+        session.begin_level_write([Some(100), None]);
+        session.finish_level_write(true);
+        assert!(session.notify(&b1(1, 90, 10)).is_empty());
+        assert_eq!(session.baseline(), [Some(100), Some(10)]);
+        assert!(session.notify(&b1(1, 100, 10)).is_empty());
+        assert_eq!(session.baseline(), [Some(100), Some(10)]);
     }
 
     #[test]
@@ -954,14 +1069,17 @@ mod tests {
             session.notify(&b1(0, 16, 15)),
             vec![Gesture::Flick { side: Side::A, steps: 1 }]
         );
-        // The next output write puts the powerbox back to the level Coyote Socket sent.
-        // A notify still in flight, or a second flick that lands on the same absolute
-        // intensity, counts as another step. There is no time debounce.
+        // The write returns the knob to 15. A repeat of the level we already
+        // counted is not another step. One step past that old level still is,
+        // and the baseline stays on the value we wrote.
         session.output_written(15, 15);
+        assert!(session.notify(&b1(0, 16, 15)).is_empty());
+        assert_eq!(session.baseline(), [Some(15), Some(15)]);
         assert_eq!(
-            session.notify(&b1(0, 16, 15)),
+            session.notify(&b1(0, 17, 15)),
             vec![Gesture::Flick { side: Side::A, steps: 1 }]
         );
+        assert_eq!(session.baseline(), [Some(15), Some(15)]);
     }
 
     #[test]

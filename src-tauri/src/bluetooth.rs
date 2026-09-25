@@ -431,8 +431,7 @@ pub fn spawn_intensity_notify(peripheral: Peripheral, characteristic: Characteri
                 next = stream.next() => {
                     match next {
                         Some(notification) if notification.uuid == NOTIFY_CHAR_UUID => {
-                            let gestures = crate::gesture::push_notify(&notification.value).await;
-                            crate::gesture::commit_gestures(gestures).await;
+                            crate::gesture::ingest_notify(&notification.value).await;
                         }
                         Some(notification) => {
                             let hex = notification
