@@ -335,8 +335,11 @@
   // Handle min range change
   function handleMinInput(event: Event) {
     const target = event.target as HTMLInputElement;
-    minValue = clampFloor(Number(target.value));
-    pinInputValue(target, minValue);
+    const raw = Number(target.value);
+    minValue = clampFloor(raw);
+    if (minValue !== raw) {
+      pinInputValue(target, minValue);
+    }
 
     dispatch('rangeChange', { min: minValue, max: maxValue });
 
@@ -353,8 +356,11 @@
   // Handle max range change
   function handleMaxInput(event: Event) {
     const target = event.target as HTMLInputElement;
-    maxValue = clampCeiling(Number(target.value));
-    pinInputValue(target, maxValue);
+    const raw = Number(target.value);
+    maxValue = clampCeiling(raw);
+    if (maxValue !== raw) {
+      pinInputValue(target, maxValue);
+    }
 
     dispatch('rangeChange', { min: minValue, max: maxValue });
 

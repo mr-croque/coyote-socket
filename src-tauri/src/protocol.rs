@@ -22,9 +22,14 @@ pub fn generate_b0_command(
     // Header
     command.push(0xB0);
 
-    // Serial number (4 bits) + interpretation methods (2 bits each)
-    // Serial is always 0, interpretations are typically 3 (0b11)
-    let interpretation_byte = ((interpretation_a & 0x03) << 2) | (interpretation_b & 0x03);
+    // High 4 bits are the serial. A write that changes channel intensity uses
+    // serial 1 so the powerbox echoes that serial on the B1. Toggle flicks
+    // stay on serial 0. A waveform-only write leaves the serial at 0.
+    let changes_intensity = (interpretation_a & 0x03) != 0 || (interpretation_b & 0x03) != 0;
+    let serial = if changes_intensity { 1 } else { 0 };
+    let interpretation_byte = (serial << 4)
+        | ((interpretation_a & 0x03) << 2)
+        | (interpretation_b & 0x03);
     command.push(interpretation_byte);
 
     // Channel intensities (0-200)
@@ -149,4 +154,28 @@ pub fn freq_to_v2_xy(frequency_hz: f64) -> (u8, u16) {
 pub fn balance_to_v2_z(balance: u8) -> u8 {
     // Map 0-255 to 0-31
     ((balance as f32 / 255.0) * 31.0).round() as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generate_b0_command;
+
+    fn periods() -> [u8; 4] {
+        [10, 10, 10, 10]
+    }
+
+    #[test]
+    fn an_intensity_write_carries_serial_one() {
+        let command = generate_b0_command(3, 0, 90, 0, periods(), [0, 0, 0, 0], periods(), [0, 0, 0, 0]);
+        assert_eq!(command[0], 0xB0);
+        // serial 1, channel A absolute (0b11), channel B unchanged (0b00)
+        assert_eq!(command[1], 0x1C);
+        assert_eq!(command[2], 90);
+    }
+
+    #[test]
+    fn a_waveform_only_write_keeps_serial_zero() {
+        let command = generate_b0_command(0, 0, 90, 55, periods(), [0, 0, 0, 0], periods(), [0, 0, 0, 0]);
+        assert_eq!(command[1], 0x00);
+    }
 }
