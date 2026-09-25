@@ -22,6 +22,7 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "node scripts/build.js",
+    "tauri:build:snapshot": "node scripts/snapshot-build.js",
     "release": "node scripts/release.js patch",
     "release:patch": "node scripts/release.js patch",
     "release:minor": "node scripts/release.js minor",
