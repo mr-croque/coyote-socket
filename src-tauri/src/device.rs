@@ -459,23 +459,34 @@ async fn send_device_update() -> Result<(), String> {
             let slot_periods_b: [u8; 4] =
                 std::array::from_fn(|i| convert_period(frequency_to_period(freq_slots_b_hz[i])));
 
-            // The powerbox toggle changes the channel-intensity knob. Hold that
-            // knob at the stored ceiling (or the fixed value) and put the live
-            // level into the waveform scale. Ordinary ticks use "no change" so
-            // a flick is not overwritten by the next output write.
-            let knob_a = if params_a.intensity_is_static {
-                scaled_a
+            // Sample the stored knob and the known device level together, after
+            // the awaits above. An earlier snapshot of the ceiling would make
+            // this packet write the pre-flick knob back.
+            let bounds = crate::gesture::sample_intensity_bounds().await;
+            let live_a = if bounds.is_static[0] {
+                bounds.static_value[0].min(max_a)
             } else {
-                range_max_a.min(max_a)
+                scale_intensity(waveform_a.intensity, bounds.range_min[0], bounds.range_max[0])
+                    .min(max_a)
             };
-            let knob_b = if params_b.intensity_is_static {
-                scaled_b
+            let live_b = if bounds.is_static[1] {
+                bounds.static_value[1].min(max_b)
             } else {
-                range_max_b.min(max_b)
+                scale_intensity(waveform_b.intensity, bounds.range_min[1], bounds.range_max[1])
+                    .min(max_b)
             };
-            let known = crate::gesture::known_levels().await;
-            let plan_a = plan_channel(scaled_a, knob_a, known[0], waveform_a.waveform_intensity);
-            let plan_b = plan_channel(scaled_b, knob_b, known[1], waveform_b.waveform_intensity);
+            let knob_a = if bounds.is_static[0] {
+                live_a
+            } else {
+                bounds.range_max[0].min(max_a)
+            };
+            let knob_b = if bounds.is_static[1] {
+                live_b
+            } else {
+                bounds.range_max[1].min(max_b)
+            };
+            let plan_a = plan_channel(live_a, knob_a, bounds.known[0], waveform_a.waveform_intensity);
+            let plan_b = plan_channel(live_b, knob_b, bounds.known[1], waveform_b.waveform_intensity);
             let absolute = [
                 (plan_a.interpretation == 3).then_some(plan_a.intensity),
                 (plan_b.interpretation == 3).then_some(plan_b.intensity),
@@ -500,8 +511,8 @@ async fn send_device_update() -> Result<(), String> {
                     crate::gesture::finish_level_write(true).await;
                     log_b0_heartbeat(
                         timestamp,
-                        scaled_a,
-                        scaled_b,
+                        live_a,
+                        live_b,
                         knob_a,
                         knob_b,
                         plan_a.interpretation,
