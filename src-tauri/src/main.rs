@@ -11,6 +11,7 @@ mod buttplug;
 mod device;
 mod diagnostic;
 mod gamepad;
+mod gesture;
 mod logging;
 mod lovense;
 mod modulation;
@@ -174,6 +175,30 @@ pub fn emit_output_pause_changed(paused: bool) {
 pub fn emit_waveform_sample(sample: waveform::WaveformSample) {
     if let Some(handle) = get_app_handle() {
         let _ = handle.emit("waveform-sample", sample);
+    }
+}
+
+/// Tell the window the intensity field a toggle-switch gesture just stored.
+/// The payload is the absolute value. The window copies it and does not classify.
+pub fn emit_intensity_field(
+    channel: processing::ChannelId,
+    ceiling: Option<f64>,
+    static_value: Option<f64>,
+) {
+    if let Some(handle) = get_app_handle() {
+        #[derive(Clone, Serialize)]
+        struct IntensityFieldPayload {
+            channel: String,
+            ceiling: Option<f64>,
+            #[serde(rename = "staticValue")]
+            static_value: Option<f64>,
+        }
+        let payload = IntensityFieldPayload {
+            channel: channel.as_char().to_string(),
+            ceiling,
+            static_value,
+        };
+        let _ = handle.emit("intensity-field", payload);
     }
 }
 
@@ -386,7 +411,24 @@ async fn connect_bluetooth_device(adapter_index: usize, address: String) -> Resu
                         }
                     };
 
+                    let version = manager.device_version;
+                    let notify_parts = manager.v3_notify_parts();
                     drop(manager); // Release lock before starting loop
+
+                    // Coyote 2 never arms. Coyote 3 starts disarmed until BF and B0 both succeed.
+                    if version == Some(bluetooth::DeviceVersion::V3) {
+                        gesture::install_session(gesture::GestureSession::coyote3()).await;
+                        if let Some((peripheral, characteristic)) = notify_parts {
+                            bluetooth::spawn_intensity_notify(peripheral, characteristic);
+                        } else {
+                            crate::log_warn!(
+                                "[V3] Notify characteristic missing. Output continues without toggle gestures."
+                            );
+                        }
+                    } else {
+                        bluetooth::cancel_intensity_notify();
+                        gesture::install_session(gesture::GestureSession::coyote2()).await;
+                    }
 
                     // Clear BF snapshot so the first tick resends balance +
                     // soft-limit params (device flash persists BF across
@@ -426,6 +468,8 @@ async fn connect_bluetooth_device(adapter_index: usize, address: String) -> Resu
 async fn disconnect_bluetooth_device() -> Result<String, String> {
     // Stop the device loop first
     stop_device_loop().await;
+    bluetooth::cancel_intensity_notify();
+    gesture::disconnect_session().await;
 
     // Clear BF snapshot so the next reconnect rewrites from scratch rather
     // than assuming the device still holds our prior values.
@@ -717,6 +761,21 @@ async fn save_channel_settings(
     Ok("Channel settings saved".to_string())
 }
 
+/// The write `update_channel_config` uses. Gesture commits call this with the
+/// current config and the patched intensity, so the next output tick reads it.
+pub(crate) async fn install_channel_config(
+    channel_id: processing::ChannelId,
+    config: crate::modulation::ChannelConfig,
+    bp_config: Option<crate::buttplug::ButtplugLinkConfig>,
+) {
+    let state = processing::get_processing_state().await;
+    let mut state_guard = state.write().await;
+    state_guard.channel_mut(channel_id).config = config;
+    if let Some(cfg) = bp_config {
+        state_guard.set_buttplug_link_config(channel_id.as_char(), cfg);
+    }
+}
+
 /// Lightweight processing-state-only update for a channel. No disk I/O.
 /// Used by the fast (50ms) frontend debounce so device output reflects UI
 /// changes immediately; `save_channel_settings` runs behind it for persistence.
@@ -735,13 +794,7 @@ async fn update_channel_config(
     let channel_id = processing::ChannelId::from_str(&channel)
         .ok_or_else(|| format!("Unknown channel: {}", channel))?;
 
-    let state = processing::get_processing_state().await;
-    let mut state_guard = state.write().await;
-    state_guard.channel_mut(channel_id).config = new_config;
-    if let Some(cfg) = bp_config {
-        state_guard.set_buttplug_link_config(channel_id.as_char(), cfg);
-    }
-    drop(state_guard);
+    install_channel_config(channel_id, new_config, bp_config).await;
 
     Ok(format!("Updated channel {} config", channel))
 }

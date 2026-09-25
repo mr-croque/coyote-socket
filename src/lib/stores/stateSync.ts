@@ -15,6 +15,7 @@
 import { writable, get } from 'svelte/store';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
+import { channelA, channelB } from './channels.js';
 
 // ============================================================================
 // Types
@@ -88,6 +89,37 @@ export const connectionState = writable<ConnectionStatus>({
 
 let connectionChangedUnlisten: UnlistenFn | null = null;
 let batteryChangedUnlisten: UnlistenFn | null = null;
+let intensityFieldUnlisten: UnlistenFn | null = null;
+
+interface IntensityFieldPayload {
+  channel: string;
+  ceiling: number | null;
+  staticValue: number | null;
+}
+
+/** Copy a backend intensity field into the channel store. No gesture math. */
+function applyIntensityField(payload: IntensityFieldPayload) {
+  const store = payload.channel === 'A' ? channelA : payload.channel === 'B' ? channelB : null;
+  if (!store) return;
+  store.update((current) => {
+    const source = current.intensitySource;
+    if (!source) return current;
+    if (payload.ceiling != null) {
+      return {
+        ...current,
+        rangeMax: payload.ceiling,
+        intensitySource: { ...source, rangeMax: payload.ceiling },
+      };
+    }
+    if (payload.staticValue != null) {
+      return {
+        ...current,
+        intensitySource: { ...source, staticValue: payload.staticValue },
+      };
+    }
+    return current;
+  });
+}
 let isStateSyncActive = false;
 
 /**
@@ -139,6 +171,13 @@ export async function startStateSync(): Promise<void> {
       }
     );
 
+    intensityFieldUnlisten = await listen<IntensityFieldPayload>(
+      'intensity-field',
+      (event) => {
+        applyIntensityField(event.payload);
+      }
+    );
+
     console.log('[StateSync] Event listeners started');
   } catch (e) {
     console.error('[StateSync] Failed to start event listeners:', e);
@@ -161,6 +200,11 @@ export function stopStateSync(): void {
   if (batteryChangedUnlisten) {
     batteryChangedUnlisten();
     batteryChangedUnlisten = null;
+  }
+
+  if (intensityFieldUnlisten) {
+    intensityFieldUnlisten();
+    intensityFieldUnlisten = null;
   }
 
   console.log('[StateSync] Event listeners stopped');

@@ -296,9 +296,11 @@ mod tests {
         // Outputs should differ as phase advances
         assert_ne!(output1, output2);
 
-        // Both should be within base ± scale range
-        assert!(output1 >= 0.1 && output1 <= 0.9);
-        assert!(output2 >= 0.1 && output2 <= 0.9);
+        // Both should be within base ± scale. Binary fractions of 0.4 sit a
+        // few ulps outside the exact 0.1 and 0.9 endpoints.
+        let inside = |value: f64| value >= 0.1 - 1e-9 && value <= 0.9 + 1e-9;
+        assert!(inside(output1));
+        assert!(inside(output2));
     }
 
     #[test]

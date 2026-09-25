@@ -437,6 +437,7 @@ async fn send_device_update() -> Result<(), String> {
                 match manager_guard.write_command(&bf_cmd).await {
                     Ok(_) => {
                         *device_state_ref.last_bf_sent.write().await = Some(desired_bf);
+                        crate::gesture::note_soft_limit_written().await;
                     }
                     Err(e) => {
                         println!("[DEBUG] V3 BF Write FAILED: {}", e);
@@ -463,7 +464,10 @@ async fn send_device_update() -> Result<(), String> {
             );
 
             match manager_guard.write_command(&command).await {
-                Ok(_) => Ok(()),
+                Ok(_) => {
+                    crate::gesture::note_output_written(scaled_a, scaled_b).await;
+                    Ok(())
+                }
                 Err(e) => {
                     crate::log_error!("[V3] B0 Write FAILED: {}", e);
                     Err(format!("Write error: {}", e))

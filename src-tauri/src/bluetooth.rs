@@ -2,8 +2,10 @@ use btleplug::api::{
     Central, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType,
 };
 use btleplug::platform::{Manager, Peripheral};
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::error::Error;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::time;
 use uuid::Uuid;
@@ -11,6 +13,8 @@ use uuid::Uuid;
 // DG-LAB Coyote UUIDs (from protocol documentation)
 // Write characteristic for B0/BF commands
 const INSTRUCTION_CHAR_UUID: Uuid = Uuid::from_u128(0x0000150a_0000_1000_8000_00805f9b34fb);
+/// V3 notify characteristic. B1 intensity reports arrive here.
+const NOTIFY_CHAR_UUID: Uuid = Uuid::from_u128(0x0000150b_0000_1000_8000_00805f9b34fb);
 // Battery level characteristic
 const BATTERY_CHAR_UUID: Uuid = Uuid::from_u128(0x00001500_0000_1000_8000_00805f9b34fb);
 
@@ -49,6 +53,7 @@ pub struct BluetoothManager {
 
     // V3 Features
     write_characteristic: Option<Characteristic>,
+    notify_characteristic: Option<Characteristic>,
 
     // V2 Features
     pub device_version: Option<DeviceVersion>,
@@ -68,6 +73,7 @@ impl BluetoothManager {
             connected_peripheral: None,
             connected_device_address: None,
             write_characteristic: None,
+            notify_characteristic: None,
             battery_characteristic: None,
             device_version: None,
             v2_char_intensity: None,
@@ -194,6 +200,7 @@ impl BluetoothManager {
         println!("Found {} services", services.len());
 
         self.write_characteristic = None;
+        self.notify_characteristic = None;
         self.battery_characteristic = None;
         self.device_version = None;
         self.v2_char_intensity = None;
@@ -210,6 +217,11 @@ impl BluetoothManager {
                     println!("  -> Found V3 write characteristic!");
                     self.write_characteristic = Some(characteristic.clone());
                     self.device_version = Some(DeviceVersion::V3);
+                }
+
+                if characteristic.uuid == NOTIFY_CHAR_UUID {
+                    println!("  -> Found V3 notify characteristic!");
+                    self.notify_characteristic = Some(characteristic.clone());
                 }
 
                 // V2 detection
@@ -307,10 +319,22 @@ impl BluetoothManager {
         self.connected_device_address.clone()
     }
 
+    /// Coyote 3 notify subscription parts. Coyote 2 has no B1 characteristic.
+    pub fn v3_notify_parts(&self) -> Option<(Peripheral, Characteristic)> {
+        if self.device_version != Some(DeviceVersion::V3) {
+            return None;
+        }
+        Some((
+            self.connected_peripheral.clone()?,
+            self.notify_characteristic.clone()?,
+        ))
+    }
+
     pub async fn disconnect_device(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
         if let Some(peripheral) = self.connected_peripheral.take() {
             peripheral.disconnect().await?;
             self.write_characteristic = None;
+            self.notify_characteristic = None;
             self.battery_characteristic = None;
             self.connected_device_address = None;
             self.device_version = None;
@@ -369,6 +393,59 @@ pub async fn get_bluetooth_manager(
             Ok(tokio::sync::Mutex::new(manager))
         })
         .await
+}
+
+static INTENSITY_NOTIFY_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Stop the intensity-notify task. The next spawned task uses a new generation.
+pub fn cancel_intensity_notify() {
+    INTENSITY_NOTIFY_GEN.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Subscribe to Coyote 3 B1 notifies and feed them to the gesture session.
+/// A failed subscribe leaves output working and gestures idle.
+pub fn spawn_intensity_notify(peripheral: Peripheral, characteristic: Characteristic) {
+    let generation = INTENSITY_NOTIFY_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+
+    tokio::spawn(async move {
+        if let Err(error) = peripheral.subscribe(&characteristic).await {
+            crate::log_warn!(
+                "[V3] Intensity notify subscribe failed: {}. Output continues without toggle gestures.",
+                error
+            );
+            return;
+        }
+
+        let mut stream = match peripheral.notifications().await {
+            Ok(stream) => stream,
+            Err(error) => {
+                crate::log_warn!(
+                    "[V3] Intensity notify stream failed: {}. Output continues without toggle gestures.",
+                    error
+                );
+                return;
+            }
+        };
+
+        loop {
+            if INTENSITY_NOTIFY_GEN.load(Ordering::SeqCst) != generation {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                next = stream.next() => {
+                    match next {
+                        Some(notification) if notification.uuid == NOTIFY_CHAR_UUID => {
+                            let gestures = crate::gesture::push_notify(&notification.value).await;
+                            crate::gesture::commit_gestures(gestures).await;
+                        }
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Spawn a background task that reads the battery level every 30 seconds
