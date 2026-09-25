@@ -214,7 +214,15 @@ pub async fn send_zero_command() {
                 [0, 0, 0, 0], // zero waveform
             );
 
-            let _ = manager_guard.write_command(&command).await;
+            match manager_guard.write_command(&command).await {
+                Ok(()) => {
+                    // The powerbox is now at 0,0. The next flick is measured from that.
+                    crate::gesture::note_output_written(0, 0).await;
+                }
+                Err(e) => {
+                    crate::log_error!("[V3] Pause zero B0 FAILED: {}", e);
+                }
+            }
         }
         DeviceVersion::V2 => {
             // Send zero intensity and neutral waveforms for V2

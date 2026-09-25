@@ -613,6 +613,23 @@ mod tests {
     }
 
     #[test]
+    fn pause_zero_write_resets_baseline_before_the_next_flick() {
+        let mut session = GestureSession::coyote3();
+        arm(&mut session, 40, 30);
+        // Successful pause zero-write: the powerbox is at 0,0.
+        session.output_written(0, 0);
+        assert_eq!(session.baseline(), [Some(0), Some(0)]);
+        assert_eq!(
+            session.notify(&b1(0, 1, 0)),
+            vec![Gesture::Flick {
+                side: Side::A,
+                steps: 1
+            }]
+        );
+        assert_eq!(session.baseline(), [Some(1), Some(0)]);
+    }
+
+    #[test]
     fn linked_flick_moves_only_the_ceiling() {
         let source = linked(10.0, 20.0);
         let next = apply_intensity_gesture(
