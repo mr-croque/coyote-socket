@@ -309,16 +309,34 @@
     });
   }
 
+  // The native thumb follows the pointer even after the stored value stops
+  // changing, so write the clamped value back onto the input.
+  function clampFloor(value: number): number {
+    return Math.max(min, Math.min(maxValue - step, value));
+  }
+
+  function clampCeiling(value: number): number {
+    return Math.min(max, Math.max(minValue + step, value));
+  }
+
+  let pinGeneration = 0;
+
+  function pinInputValue(target: HTMLInputElement, value: number) {
+    const pinned = String(value);
+    const generation = ++pinGeneration;
+    target.value = pinned;
+    requestAnimationFrame(() => {
+      if (generation === pinGeneration && target.value !== pinned) {
+        target.value = pinned;
+      }
+    });
+  }
+
   // Handle min range change
   function handleMinInput(event: Event) {
     const target = event.target as HTMLInputElement;
-    const newValue = Number(target.value);
-
-    if (newValue < maxValue) {
-      minValue = newValue;
-    } else {
-      minValue = maxValue - step;
-    }
+    minValue = clampFloor(Number(target.value));
+    pinInputValue(target, minValue);
 
     dispatch('rangeChange', { min: minValue, max: maxValue });
 
@@ -335,13 +353,8 @@
   // Handle max range change
   function handleMaxInput(event: Event) {
     const target = event.target as HTMLInputElement;
-    const newValue = Number(target.value);
-
-    if (newValue > minValue) {
-      maxValue = newValue;
-    } else {
-      maxValue = minValue + step;
-    }
+    maxValue = clampCeiling(Number(target.value));
+    pinInputValue(target, maxValue);
 
     dispatch('rangeChange', { min: minValue, max: maxValue });
 
