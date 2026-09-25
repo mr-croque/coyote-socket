@@ -11,7 +11,7 @@ use crate::protocol::{
 use crate::waveform::WaveformSample;
 use crate::websocket::{get_next_waveform_data, get_resolved_channel_params};
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
@@ -238,7 +238,6 @@ pub async fn send_zero_command() {
 }
 
 // Debug counter for logging
-use std::sync::atomic::AtomicU64;
 static DEBUG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Send a single update to the device
@@ -460,23 +459,58 @@ async fn send_device_update() -> Result<(), String> {
             let slot_periods_b: [u8; 4] =
                 std::array::from_fn(|i| convert_period(frequency_to_period(freq_slots_b_hz[i])));
 
+            // The powerbox toggle changes the channel-intensity knob. Hold that
+            // knob at the stored ceiling (or the fixed value) and put the live
+            // level into the waveform scale. Ordinary ticks use "no change" so
+            // a flick is not overwritten by the next output write.
+            let knob_a = if params_a.intensity_is_static {
+                scaled_a
+            } else {
+                range_max_a.min(max_a)
+            };
+            let knob_b = if params_b.intensity_is_static {
+                scaled_b
+            } else {
+                range_max_b.min(max_b)
+            };
+            let known = crate::gesture::known_levels().await;
+            let plan_a = plan_channel(scaled_a, knob_a, known[0], waveform_a.waveform_intensity);
+            let plan_b = plan_channel(scaled_b, knob_b, known[1], waveform_b.waveform_intensity);
+            let absolute = [
+                (plan_a.interpretation == 3).then_some(plan_a.intensity),
+                (plan_b.interpretation == 3).then_some(plan_b.intensity),
+            ];
+
             let command = generate_b0_command(
-                3,
-                3,
-                scaled_a,
-                scaled_b,
+                plan_a.interpretation,
+                plan_b.interpretation,
+                plan_a.intensity,
+                plan_b.intensity,
                 slot_periods_a,
-                waveform_a.waveform_intensity,
+                plan_a.waveform,
                 slot_periods_b,
-                waveform_b.waveform_intensity,
+                plan_b.waveform,
             );
 
+            if absolute.iter().any(|level| level.is_some()) {
+                crate::gesture::begin_level_write(absolute).await;
+            }
             match manager_guard.write_command(&command).await {
                 Ok(_) => {
-                    crate::gesture::note_output_written(scaled_a, scaled_b).await;
+                    crate::gesture::finish_level_write(true).await;
+                    log_b0_heartbeat(
+                        timestamp,
+                        scaled_a,
+                        scaled_b,
+                        knob_a,
+                        knob_b,
+                        plan_a.interpretation,
+                        plan_b.interpretation,
+                    );
                     Ok(())
                 }
                 Err(e) => {
+                    crate::gesture::finish_level_write(false).await;
                     crate::log_error!("[V3] B0 Write FAILED: {}", e);
                     Err(format!("Write error: {}", e))
                 }
@@ -557,6 +591,66 @@ async fn send_device_update() -> Result<(), String> {
     }
 }
 
+/// One line a second of the live level and the knob the toggle is holding.
+/// Logging every 10Hz tick would bury a flick.
+fn log_b0_heartbeat(
+    timestamp: u64,
+    live_a: u8,
+    live_b: u8,
+    knob_a: u8,
+    knob_b: u8,
+    interp_a: u8,
+    interp_b: u8,
+) {
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    let last = LAST_MS.load(Ordering::Relaxed);
+    if timestamp.saturating_sub(last) < 1000 {
+        return;
+    }
+    if LAST_MS
+        .compare_exchange(last, timestamp, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    crate::gesture::trace_line(&format!(
+        "b0 live A={live_a} B={live_b} knob A={knob_a} B={knob_b} interp {interp_a}/{interp_b}"
+    ));
+}
+
+/// How one channel's intensity byte and waveform are written.
+///
+/// The device multiplies channel intensity by each waveform slot. Holding the
+/// knob still and scaling the waveform keeps today's felt level, while leaving
+/// the toggle a value it can move.
+#[derive(Debug, PartialEq, Eq)]
+struct ChannelWrite {
+    interpretation: u8,
+    intensity: u8,
+    waveform: [u8; 4],
+}
+
+fn plan_channel(live: u8, knob: u8, known: Option<u8>, shape: [u8; 4]) -> ChannelWrite {
+    let knob = knob.min(200);
+    let live = live.min(knob);
+    ChannelWrite {
+        interpretation: if known == Some(knob) { 0 } else { 3 },
+        intensity: knob,
+        waveform: waveform_for_knob(shape, live, knob),
+    }
+}
+
+fn waveform_for_knob(shape: [u8; 4], live: u8, knob: u8) -> [u8; 4] {
+    if live == 0 || knob == 0 {
+        return [0, 0, 0, 0];
+    }
+    if live >= knob {
+        return shape;
+    }
+    let factor = live as f64 / knob as f64;
+    shape.map(|slot| ((slot as f64) * factor).round().clamp(0.0, 100.0) as u8)
+}
+
 /// Scale intensity based on range limits
 fn scale_intensity(intensity: u8, min: u8, max: u8) -> u8 {
     if max <= min {
@@ -591,4 +685,48 @@ pub async fn get_channel_a_params() -> ChannelParams {
 pub async fn get_channel_b_params() -> ChannelParams {
     let state = get_device_state().await;
     state.channel_b_params.read().await.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resting_wave_is_silent_and_the_known_knob_is_left_alone() {
+        let plan = plan_channel(0, 90, Some(90), [100, 100, 100, 100]);
+        assert_eq!(plan.interpretation, 0);
+        assert_eq!(plan.intensity, 90);
+        assert_eq!(plan.waveform, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn first_write_sets_the_knob_and_stays_silent_at_rest() {
+        let plan = plan_channel(0, 90, None, [100, 100, 100, 100]);
+        assert_eq!(plan.interpretation, 3);
+        assert_eq!(plan.intensity, 90);
+        assert_eq!(plan.waveform, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn partial_input_scales_the_wave_under_the_knob() {
+        let plan = plan_channel(45, 90, Some(90), [100, 50, 0, 20]);
+        assert_eq!(plan.interpretation, 0);
+        assert_eq!(plan.intensity, 90);
+        assert_eq!(plan.waveform, [50, 25, 0, 10]);
+    }
+
+    #[test]
+    fn full_input_keeps_the_wave_shape() {
+        let plan = plan_channel(90, 90, Some(90), [100, 40, 0, 10]);
+        assert_eq!(plan.interpretation, 0);
+        assert_eq!(plan.waveform, [100, 40, 0, 10]);
+    }
+
+    #[test]
+    fn a_new_knob_is_written_absolutely() {
+        let plan = plan_channel(0, 91, Some(90), [100, 100, 100, 100]);
+        assert_eq!(plan.interpretation, 3);
+        assert_eq!(plan.intensity, 91);
+        assert_eq!(plan.waveform, [0, 0, 0, 0]);
+    }
 }

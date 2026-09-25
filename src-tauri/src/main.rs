@@ -419,15 +419,15 @@ async fn connect_bluetooth_device(adapter_index: usize, address: String) -> Resu
                     if version == Some(bluetooth::DeviceVersion::V3) {
                         gesture::install_session(gesture::GestureSession::coyote3()).await;
                         if let Some((peripheral, characteristic)) = notify_parts {
+                            gesture::trace_line("session coyote3");
                             bluetooth::spawn_intensity_notify(peripheral, characteristic);
                         } else {
-                            crate::log_warn!(
-                                "[V3] Notify characteristic missing. Output continues without toggle gestures."
-                            );
+                            gesture::trace_line("session coyote3 missing 150B characteristic");
                         }
                     } else {
                         bluetooth::cancel_intensity_notify();
                         gesture::install_session(gesture::GestureSession::coyote2()).await;
+                        gesture::trace_line("session coyote2");
                     }
 
                     // Clear BF snapshot so the first tick resends balance +
@@ -470,6 +470,7 @@ async fn disconnect_bluetooth_device() -> Result<String, String> {
     stop_device_loop().await;
     bluetooth::cancel_intensity_notify();
     gesture::disconnect_session().await;
+    gesture::trace_line("session disconnect");
 
     // Clear BF snapshot so the next reconnect rewrites from scratch rather
     // than assuming the device still holds our prior values.
@@ -1447,6 +1448,8 @@ fn main() {
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             diagnostic::init(diag_dir);
             log_info!("CoyoteSocket starting up");
+            logging::flush_now();
+            gesture::trace_line("startup");
 
             // Store the AppHandle for global event emission
             set_app_handle(app.handle().clone());

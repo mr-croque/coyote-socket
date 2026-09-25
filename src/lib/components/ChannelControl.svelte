@@ -401,7 +401,7 @@
       indicatorValue={intensityIndicator}
       min={0}
       max={channel === 'A' ? $generalSettings.channelAMaxIntensity : $generalSettings.channelBMaxIntensity}
-      step={2}
+      step={1}
       compact={compact}
       showLabels={true}
       showWrapper={false}

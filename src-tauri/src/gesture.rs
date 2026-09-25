@@ -73,6 +73,11 @@ pub struct GestureSession {
     output_ok: bool,
     armed: bool,
     baseline: [Option<u8>; 2],
+    /// Intensities the last successful absolute write sent.
+    commanded: [Option<u8>; 2],
+    /// Absolute knob write currently in flight. A B1 of these values is that
+    /// write, not a toggle.
+    pending: [Option<u8>; 2],
 }
 
 impl GestureSession {
@@ -91,6 +96,8 @@ impl GestureSession {
             output_ok: false,
             armed: false,
             baseline: [None, None],
+            commanded: [None, None],
+            pending: [None, None],
         }
     }
 
@@ -111,14 +118,46 @@ impl GestureSession {
         self.armed = self.soft_limit_ok && self.output_ok;
     }
 
-    /// A successful B0 output write. Sets the baseline to the intensities just sent.
+    /// A successful absolute write of both channel knobs.
     pub fn output_written(&mut self, channel_a: u8, channel_b: u8) {
         if !self.enabled {
             return;
         }
-        self.baseline = [Some(channel_a.min(200)), Some(channel_b.min(200))];
+        self.pending = [None, None];
+        let commanded = [Some(channel_a.min(200)), Some(channel_b.min(200))];
+        self.commanded = commanded;
+        self.baseline = commanded;
         self.output_ok = true;
         self.armed = self.soft_limit_ok && self.output_ok;
+    }
+
+    /// Remember an absolute knob write that has been handed to the radio but
+    /// not yet acknowledged. `None` leaves that side's in-flight value alone.
+    pub fn begin_level_write(&mut self, levels: [Option<u8>; 2]) {
+        if !self.enabled {
+            return;
+        }
+        for (slot, level) in self.pending.iter_mut().zip(levels) {
+            if let Some(level) = level {
+                *slot = Some(level.min(200));
+            }
+        }
+    }
+
+    /// The absolute write finished. On success the in-flight values become the
+    /// knob the next toggle is measured from.
+    pub fn finish_level_write(&mut self, ok: bool) {
+        if self.enabled && ok {
+            for index in 0..2 {
+                if let Some(level) = self.pending[index] {
+                    self.commanded[index] = Some(level);
+                    self.baseline[index] = Some(level);
+                }
+            }
+            self.output_ok = true;
+            self.armed = self.soft_limit_ok && self.output_ok;
+        }
+        self.pending = [None, None];
     }
 
     /// Disconnect clears the baseline and disarms. The next connection needs both writes again.
@@ -145,7 +184,7 @@ impl GestureSession {
             let Some(baseline) = self.baseline[index] else {
                 continue;
             };
-            if reported == baseline {
+            if self.pending[index] == Some(reported) || reported == baseline {
                 continue;
             }
             let side = if index == 0 { Side::A } else { Side::B };
@@ -158,6 +197,7 @@ impl GestureSession {
                 }
             };
             self.baseline[index] = Some(reported);
+            self.commanded[index] = Some(reported);
             gestures.push(gesture);
         }
         gestures
@@ -285,6 +325,71 @@ fn apply_gesture_to_config(
     next
 }
 
+/// Append one investigation line to the ring log and to `gesture-trace.log`
+/// beside the executable. Called on connect, on each B1, and about once a
+/// second while a Coyote 3 output write is succeeding.
+pub fn trace_line(message: &str) {
+    crate::log_info!("[gesture] {message}");
+    crate::logging::flush_now();
+
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(dir) = exe.parent() else {
+        return;
+    };
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("gesture-trace.log"))
+    else {
+        return;
+    };
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    use std::io::Write;
+    let _ = writeln!(file, "[{timestamp}] {message}");
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn fmt_baseline(baseline: [Option<u8>; 2]) -> String {
+    format!("A={} B={}", fmt_level(baseline[0]), fmt_level(baseline[1]))
+}
+
+fn fmt_level(value: Option<u8>) -> String {
+    match value {
+        Some(level) => level.to_string(),
+        None => "-".to_string(),
+    }
+}
+
+fn fmt_gestures(gestures: &[Gesture]) -> String {
+    if gestures.is_empty() {
+        return "none".to_string();
+    }
+    gestures
+        .iter()
+        .map(|gesture| match gesture {
+            Gesture::Flick { side, steps } => format!("flick {side:?} {steps:+}"),
+            Gesture::Press { side } => format!("press {side:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn channel_id_label(channel_id: crate::processing::ChannelId) -> char {
+    channel_id.as_char()
+}
+
 fn session_slot() -> &'static tokio::sync::Mutex<GestureSession> {
     static SESSION: std::sync::OnceLock<tokio::sync::Mutex<GestureSession>> = std::sync::OnceLock::new();
     SESSION.get_or_init(|| tokio::sync::Mutex::new(GestureSession::coyote2()))
@@ -307,8 +412,36 @@ pub async fn note_output_written(channel_a: u8, channel_b: u8) {
     session_slot().lock().await.output_written(channel_a, channel_b);
 }
 
+pub async fn known_levels() -> [Option<u8>; 2] {
+    session_slot().lock().await.baseline()
+}
+
+pub async fn begin_level_write(levels: [Option<u8>; 2]) {
+    session_slot().lock().await.begin_level_write(levels);
+}
+
+pub async fn finish_level_write(ok: bool) {
+    session_slot().lock().await.finish_level_write(ok);
+}
+
 pub async fn push_notify(bytes: &[u8]) -> Vec<Gesture> {
-    session_slot().lock().await.notify(bytes)
+    let (gestures, message) = {
+        let mut session = session_slot().lock().await;
+        let armed = session.is_armed();
+        let before = session.baseline();
+        let gestures = session.notify(bytes);
+        let after = session.baseline();
+        let message = format!(
+            "notify hex={} armed={armed} before={} after={} gestures={}",
+            hex_bytes(bytes),
+            fmt_baseline(before),
+            fmt_baseline(after),
+            fmt_gestures(&gestures),
+        );
+        (gestures, message)
+    };
+    trace_line(&message);
+    gestures
 }
 
 /// Write each gesture onto the live channel config, then tell the window the new fields.
@@ -336,6 +469,14 @@ pub async fn commit_gestures(gestures: Vec<Gesture>) {
         let mut config = guard.channel(channel_id).config.clone();
         let before = config.intensity.clone();
         let after = apply_intensity_gesture(&before, gesture, cap);
+        trace_line(&format!(
+            "commit {} {gesture:?} ceiling {:.0}->{:.0} static {:?}->{:?} cap={cap}",
+            channel_id_label(channel_id),
+            before.range_max,
+            after.range_max,
+            before.static_value,
+            after.static_value,
+        ));
         let patch = intensity_patch(&before, &after);
         config.intensity = after;
         pending.push((channel_id, config, patch));
@@ -548,6 +689,84 @@ mod tests {
         arm(&mut already_zero, 0, 0);
         assert!(already_zero.notify(&b1(0, 0, 0)).is_empty());
         assert_eq!(already_zero.baseline(), [Some(0), Some(0)]);
+    }
+
+    #[test]
+    fn switch_moves_the_held_knob_up_down_and_press() {
+        // The powerbox holds the ceiling. A flick reports the new absolute
+        // knob. A short press reports 0.
+        let mut session = GestureSession::coyote3();
+        arm(&mut session, 90, 67);
+
+        assert_eq!(
+            session.notify(&b1(0, 91, 67)),
+            vec![Gesture::Flick {
+                side: Side::A,
+                steps: 1
+            }]
+        );
+        assert_eq!(
+            session.notify(&b1(0, 90, 67)),
+            vec![Gesture::Flick {
+                side: Side::A,
+                steps: -1
+            }]
+        );
+        assert_eq!(
+            session.notify(&b1(0, 0, 67)),
+            vec![Gesture::Press { side: Side::A }]
+        );
+        assert!(session.notify(&b1(0, 0, 67)).is_empty());
+        assert_eq!(session.baseline(), [Some(0), Some(67)]);
+    }
+
+    #[test]
+    fn in_flight_absolute_write_is_not_a_flick() {
+        let mut session = GestureSession::coyote3();
+        arm(&mut session, 80, 67);
+        session.begin_level_write([Some(90), None]);
+        assert!(session.notify(&b1(0, 90, 67)).is_empty());
+        assert_eq!(session.baseline(), [Some(80), Some(67)]);
+
+        session.finish_level_write(true);
+        assert_eq!(session.baseline(), [Some(90), Some(67)]);
+        assert_eq!(
+            session.notify(&b1(0, 89, 67)),
+            vec![Gesture::Flick {
+                side: Side::A,
+                steps: -1
+            }]
+        );
+    }
+
+    #[test]
+    fn downward_flick_and_press_still_count_when_they_leave_the_commanded_level() {
+        let mut down = GestureSession::coyote3();
+        arm(&mut down, 20, 20);
+        assert_eq!(
+            down.notify(&b1(0, 19, 20)),
+            vec![Gesture::Flick {
+                side: Side::A,
+                steps: -1
+            }]
+        );
+        assert_eq!(
+            down.notify(&b1(0, 20, 20)),
+            vec![Gesture::Flick {
+                side: Side::A,
+                steps: 1
+            }]
+        );
+        assert_eq!(down.baseline(), [Some(20), Some(20)]);
+
+        let mut press = GestureSession::coyote3();
+        arm(&mut press, 40, 8);
+        assert_eq!(
+            press.notify(&b1(0, 0, 8)),
+            vec![Gesture::Press { side: Side::A }]
+        );
+        assert!(press.notify(&b1(0, 0, 8)).is_empty());
+        assert_eq!(press.baseline(), [Some(0), Some(8)]);
     }
 
     #[test]

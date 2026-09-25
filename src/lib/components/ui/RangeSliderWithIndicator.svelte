@@ -156,17 +156,22 @@
       const actualFreq = 1000 / period;
       return `${actualFreq.toFixed(1)} Hz`;
     } else if (isIntensity) {
-      return `${Math.round(value / 2)}%`;
+      return formatIntensityPercent(value);
     } else {
       return `${Math.round(value)}`;
     }
+  }
+
+  // One device step is 0.5%. An integer percent hides every other flick.
+  function formatIntensityPercent(value: number): string {
+    return `${(value / 2).toFixed(1)}%`;
   }
 
   // Format intensity range display: "{distance} | {max}"
   function formatIntensityRange(minVal: number, maxVal: number): string {
     const distance = (maxVal - minVal) / 2;
     const maximum = maxVal / 2;
-    return `${Math.round(distance)}% | ${Math.round(maximum)}%`;
+    return `${distance.toFixed(1)}% | ${maximum.toFixed(1)}%`;
   }
 
   // Handle axis button click (radio button behavior - click again to deselect)

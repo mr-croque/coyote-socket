@@ -409,20 +409,15 @@ pub fn spawn_intensity_notify(peripheral: Peripheral, characteristic: Characteri
 
     tokio::spawn(async move {
         if let Err(error) = peripheral.subscribe(&characteristic).await {
-            crate::log_warn!(
-                "[V3] Intensity notify subscribe failed: {}. Output continues without toggle gestures.",
-                error
-            );
+            crate::gesture::trace_line(&format!("subscribe 150B failed: {error}"));
             return;
         }
+        crate::gesture::trace_line("subscribed 150B");
 
         let mut stream = match peripheral.notifications().await {
             Ok(stream) => stream,
             Err(error) => {
-                crate::log_warn!(
-                    "[V3] Intensity notify stream failed: {}. Output continues without toggle gestures.",
-                    error
-                );
+                crate::gesture::trace_line(&format!("notify stream failed: {error}"));
                 return;
             }
         };
@@ -439,7 +434,18 @@ pub fn spawn_intensity_notify(peripheral: Peripheral, characteristic: Characteri
                             let gestures = crate::gesture::push_notify(&notification.value).await;
                             crate::gesture::commit_gestures(gestures).await;
                         }
-                        Some(_) => {}
+                        Some(notification) => {
+                            let hex = notification
+                                .value
+                                .iter()
+                                .map(|byte| format!("{byte:02X}"))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            crate::gesture::trace_line(&format!(
+                                "other-notify uuid={} hex={hex}",
+                                notification.uuid
+                            ));
+                        }
                         None => break,
                     }
                 }
